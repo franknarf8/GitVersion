@@ -58,11 +58,40 @@ namespace GitVersion.VersionCalculation
                 BaseVersion baseVersionWithOldestSource;
                 if (matchingVersionsOnceIncremented.Any())
                 {
-                    var oldest = matchingVersionsOnceIncremented.Aggregate((v1, v2) =>
-                        v1.Version!.BaseVersionSource!.When < v2.Version!.BaseVersionSource!.When ? v1 : v2);
-                    baseVersionWithOldestSource = oldest!.Version!;
-                    maxVersion = oldest;
-                    this.log.Info($"Found multiple base versions which will produce the same SemVer ({maxVersion.IncrementedVersion}), taking oldest source for commit counting ({baseVersionWithOldestSource!.Source})");
+                    if (matchingVersionsOnceIncremented.Count > 1)
+                    {
+                        log.Info($"Found multiple base versions which will produce the same SemVer ({maxVersion.IncrementedVersion})");
+                        log.Info($"Here are the different source candidate for commit counting : ");
+                        foreach (var baseVersion in matchingVersionsOnceIncremented.Select(b => b.Version))
+                        {
+                            if (baseVersion != null)
+                            {
+                                log.Info($" - {BaseVersionToString(baseVersion)}");
+                            }
+                        }
+
+                        var tagVersions = matchingVersionsOnceIncremented.FindAll(b => b.Version != null && b.Version.Source.Contains("Git tag"));
+
+                        if (tagVersions.Count > 0)
+                        {
+                            log.Info("As there are Git tags, the other sources will be discarded");
+                            matchingVersionsOnceIncremented = tagVersions;
+                        }
+
+                        maxVersion = matchingVersionsOnceIncremented.Aggregate((v1, v2) =>
+                            v1.Version!.BaseVersionSource!.When < v2.Version!.BaseVersionSource!.When ? v1 : v2);
+                        baseVersionWithOldestSource = maxVersion!.Version!;
+                        log.Info($"Taking oldest source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}");
+                    }
+                    else
+                    {
+                        maxVersion = matchingVersionsOnceIncremented.First();
+                        baseVersionWithOldestSource = maxVersion!.Version!;
+                        log.Info(
+                        $"Found a base versions which will produce the following SemVer ({maxVersion.IncrementedVersion}), " +
+                              $"with the following source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}"
+                        );
+                    }
                 }
                 else
                 {
@@ -81,11 +110,17 @@ namespace GitVersion.VersionCalculation
                     maxVersion.Version!.Source, maxVersion.Version.ShouldIncrement, maxVersion.Version.SemanticVersion,
                     baseVersionWithOldestSource.BaseVersionSource, maxVersion.Version.BranchNameOverride);
 
-                this.log.Info($"Base version used: {calculatedBase}");
+                log.Info($"Base version used: {calculatedBase}");
 
                 return calculatedBase;
             }
         }
+
+        private string BaseVersionToString(BaseVersion baseVersion)
+        {
+            return $"{baseVersion!.Source} ({baseVersion!.BaseVersionSource!.Sha})";
+        }
+
         private IEnumerable<BaseVersion> GetBaseVersions(IVersionStrategy strategy)
         {
             foreach (var version in strategy.GetVersions())

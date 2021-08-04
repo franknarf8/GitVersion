@@ -48,12 +48,13 @@ namespace GitVersion.Core.Tests.IntegrationTests
             // Merge to develop
             fixture.Checkout("develop");
             fixture.Repository.MergeNoFF("release/1.0.0");
-            fixture.AssertFullSemver("1.1.0-alpha.2");
+            fixture.AssertFullSemver("1.1.0-alpha.1");
 
             fixture.Repository.MakeACommit();
+            fixture.AssertFullSemver("1.1.0-alpha.2");
             fixture.Repository.Branches.Remove("release/1.0.0");
 
-            fixture.AssertFullSemver("1.1.0-alpha.3");
+            fixture.AssertFullSemver("1.1.0-alpha.2");
         }
 
         [Test]
