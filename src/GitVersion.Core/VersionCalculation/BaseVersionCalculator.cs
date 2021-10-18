@@ -1,188 +1,182 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using GitVersion.Common;
 using GitVersion.Configuration;
 using GitVersion.Logging;
 
-namespace GitVersion.VersionCalculation
+namespace GitVersion.VersionCalculation;
+
+public class BaseVersionCalculator : IBaseVersionCalculator
 {
-    public class BaseVersionCalculator : IBaseVersionCalculator
+    private readonly ILog log;
+    private readonly IRepositoryStore repositoryStore;
+    private readonly IVersionStrategy[] strategies;
+    private readonly Lazy<GitVersionContext> versionContext;
+    private GitVersionContext context => this.versionContext.Value;
+
+    public BaseVersionCalculator(ILog log, IRepositoryStore repositoryStore, Lazy<GitVersionContext> versionContext, IEnumerable<IVersionStrategy> strategies)
     {
-        private readonly ILog log;
-        private readonly IRepositoryStore repositoryStore;
-        private readonly IVersionStrategy[] strategies;
-        private readonly Lazy<GitVersionContext> versionContext;
-        private GitVersionContext context => this.versionContext.Value;
+        this.log = log ?? throw new ArgumentNullException(nameof(log));
+        this.repositoryStore = repositoryStore ?? throw new ArgumentNullException(nameof(repositoryStore));
+        this.strategies = strategies?.ToArray() ?? Array.Empty<IVersionStrategy>();
+        this.versionContext = versionContext ?? throw new ArgumentNullException(nameof(versionContext));
+    }
 
-        public BaseVersionCalculator(ILog log, IRepositoryStore repositoryStore, Lazy<GitVersionContext> versionContext, IEnumerable<IVersionStrategy> strategies)
+    public BaseVersion GetBaseVersion()
+    {
+        using (this.log.IndentLog("Calculating base versions"))
         {
-            this.log = log ?? throw new ArgumentNullException(nameof(log));
-            this.repositoryStore = repositoryStore ?? throw new ArgumentNullException(nameof(repositoryStore));
-            this.strategies = strategies?.ToArray() ?? Array.Empty<IVersionStrategy>();
-            this.versionContext = versionContext ?? throw new ArgumentNullException(nameof(versionContext));
-        }
-
-        public BaseVersion GetBaseVersion()
-        {
-            using (this.log.IndentLog("Calculating base versions"))
+            var allVersions = new List<BaseVersion>();
+            foreach (var strategy in this.strategies)
             {
-                var allVersions = new List<BaseVersion>();
-                foreach (var strategy in this.strategies)
-                {
-                    var baseVersions = GetBaseVersions(strategy).ToList();
-                    allVersions.AddRange(baseVersions);
-                }
+                var baseVersions = GetBaseVersions(strategy).ToList();
+                allVersions.AddRange(baseVersions);
+            }
 
-                var versions = allVersions
-                    .Select(baseVersion => new Versions
-                    {
-                        IncrementedVersion = this.repositoryStore.MaybeIncrement(baseVersion, context),
-                        Version = baseVersion
-                    })
+            var versions = allVersions
+                .Select(baseVersion => new Versions
+                {
+                    IncrementedVersion = this.repositoryStore.MaybeIncrement(baseVersion, context),
+                    Version = baseVersion
+                })
+                .ToList();
+
+            FixTheBaseVersionSourceOfMergeMessageStrategyIfReleaseBranchWasMergedAndDeleted(versions);
+
+            if (context.Configuration?.VersioningMode == VersioningMode.Mainline)
+            {
+                versions = versions
+                    .Where(b => b.IncrementedVersion?.PreReleaseTag?.HasTag() != true)
                     .ToList();
+            }
 
-                FixTheBaseVersionSourceOfMergeMessageStrategyIfReleaseBranchWasMergedAndDeleted(versions);
-
-                if (context.Configuration?.VersioningMode == VersioningMode.Mainline)
+            var maxVersion = versions.Aggregate((v1, v2) => v1.IncrementedVersion! > v2.IncrementedVersion! ? v1 : v2);
+            var matchingVersionsOnceIncremented = versions
+                .Where(b => b.Version?.BaseVersionSource != null && b.IncrementedVersion == maxVersion.IncrementedVersion)
+                .ToList();
+            BaseVersion baseVersionWithOldestSource;
+            if (matchingVersionsOnceIncremented.Any())
+            {
+                if (matchingVersionsOnceIncremented.Count > 1)
                 {
-                    versions = versions
-                        .Where(b => b.IncrementedVersion?.PreReleaseTag?.HasTag() != true)
-                        .ToList();
-                }
-
-                var maxVersion = versions.Aggregate((v1, v2) => v1.IncrementedVersion! > v2.IncrementedVersion! ? v1 : v2);
-                var matchingVersionsOnceIncremented = versions
-                    .Where(b => b.Version?.BaseVersionSource != null && b.IncrementedVersion == maxVersion.IncrementedVersion)
-                    .ToList();
-                BaseVersion baseVersionWithOldestSource;
-                if (matchingVersionsOnceIncremented.Any())
-                {
-                    if (matchingVersionsOnceIncremented.Count > 1)
+                    log.Info($"Found multiple base versions which will produce the same SemVer ({maxVersion.IncrementedVersion})");
+                    log.Info($"Here are the different source candidate for commit counting : ");
+                    foreach (var baseVersion in matchingVersionsOnceIncremented.Select(b => b.Version))
                     {
-                        log.Info($"Found multiple base versions which will produce the same SemVer ({maxVersion.IncrementedVersion})");
-                        log.Info($"Here are the different source candidate for commit counting : ");
-                        foreach (var baseVersion in matchingVersionsOnceIncremented.Select(b => b.Version))
+                        if (baseVersion != null)
                         {
-                            if (baseVersion != null)
-                            {
-                                log.Info($" - {BaseVersionToString(baseVersion)}");
-                            }
+                            log.Info($" - {BaseVersionToString(baseVersion)}");
                         }
-
-                        var tagVersions = matchingVersionsOnceIncremented.FindAll(b => b.Version != null && b.Version.Source.Contains("Git tag"));
-
-                        if (tagVersions.Count > 0)
-                        {
-                            log.Info("As there are Git tags, the other sources will be discarded");
-                            matchingVersionsOnceIncremented = tagVersions;
-                        }
-
-                        maxVersion = matchingVersionsOnceIncremented.Aggregate((v1, v2) =>
-                            v1.Version!.BaseVersionSource!.When < v2.Version!.BaseVersionSource!.When ? v1 : v2);
-                        baseVersionWithOldestSource = maxVersion!.Version!;
-                        log.Info($"Taking oldest source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}");
                     }
-                    else
+
+                    var tagVersions = matchingVersionsOnceIncremented.FindAll(b => b.Version != null && b.Version.Source.Contains("Git tag"));
+
+                    if (tagVersions.Count > 0)
                     {
-                        maxVersion = matchingVersionsOnceIncremented.First();
-                        baseVersionWithOldestSource = maxVersion!.Version!;
-                        log.Info(
-                        $"Found a base versions which will produce the following SemVer ({maxVersion.IncrementedVersion}), " +
-                              $"with the following source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}"
-                        );
+                        log.Info("As there are Git tags, the other sources will be discarded");
+                        matchingVersionsOnceIncremented = tagVersions;
                     }
+
+                    maxVersion = matchingVersionsOnceIncremented.Aggregate((v1, v2) =>
+                        v1.Version!.BaseVersionSource!.When < v2.Version!.BaseVersionSource!.When ? v1 : v2);
+                    baseVersionWithOldestSource = maxVersion!.Version!;
+                    log.Info($"Taking oldest source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}");
                 }
                 else
                 {
-                    baseVersionWithOldestSource = versions
-                        .Where(v => v.Version?.BaseVersionSource != null)
-                        .OrderByDescending(v => v.IncrementedVersion)
-                        .ThenByDescending(v => v.Version!.BaseVersionSource!.When)
-                        .First()
-                        .Version!;
+                    maxVersion = matchingVersionsOnceIncremented.First();
+                    baseVersionWithOldestSource = maxVersion!.Version!;
+                    log.Info(
+                    $"Found a base versions which will produce the following SemVer ({maxVersion.IncrementedVersion}), " +
+                          $"with the following source for commit counting : {BaseVersionToString(baseVersionWithOldestSource)}"
+                    );
                 }
-
-                if (baseVersionWithOldestSource.BaseVersionSource == null)
-                    throw new Exception("Base version should not be null");
-
-                var calculatedBase = new BaseVersion(
-                    maxVersion.Version!.Source, maxVersion.Version.ShouldIncrement, maxVersion.Version.SemanticVersion,
-                    baseVersionWithOldestSource.BaseVersionSource, maxVersion.Version.BranchNameOverride);
-
-                log.Info($"Base version used: {calculatedBase}");
-
-                return calculatedBase;
             }
-        }
-
-        private string BaseVersionToString(BaseVersion baseVersion)
-        {
-            return $"{baseVersion!.Source} ({baseVersion!.BaseVersionSource!.Sha})";
-        }
-
-        private IEnumerable<BaseVersion> GetBaseVersions(IVersionStrategy strategy)
-        {
-            foreach (var version in strategy.GetVersions())
+            else
             {
-                if (version == null) continue;
+                baseVersionWithOldestSource = versions
+                    .Where(v => v.Version?.BaseVersionSource != null)
+                    .OrderByDescending(v => v.IncrementedVersion)
+                    .ThenByDescending(v => v.Version!.BaseVersionSource!.When)
+                    .First()
+                    .Version!;
+            }
 
-                this.log.Info(version.ToString());
-                if (strategy is FallbackVersionStrategy || IncludeVersion(version))
-                {
-                    yield return version;
-                }
+            if (baseVersionWithOldestSource.BaseVersionSource == null)
+                throw new Exception("Base version should not be null");
+
+            var calculatedBase = new BaseVersion(
+                maxVersion.Version!.Source, maxVersion.Version.ShouldIncrement, maxVersion.Version.SemanticVersion,
+                baseVersionWithOldestSource.BaseVersionSource, maxVersion.Version.BranchNameOverride);
+
+            log.Info($"Base version used: {calculatedBase}");
+
+            return calculatedBase;
+        }
+    }
+
+    private static string BaseVersionToString(BaseVersion baseVersion) =>
+        $"{baseVersion!.Source} ({baseVersion!.BaseVersionSource!.Sha})";
+
+    private IEnumerable<BaseVersion> GetBaseVersions(IVersionStrategy strategy)
+    {
+        foreach (var version in strategy.GetVersions())
+        {
+            if (version == null) continue;
+
+            this.log.Info(version.ToString());
+            if (strategy is FallbackVersionStrategy || IncludeVersion(version))
+            {
+                yield return version;
             }
         }
-        private bool IncludeVersion(BaseVersion version)
+    }
+    private bool IncludeVersion(BaseVersion version)
+    {
+        if (context.Configuration == null)
+            return false;
+
+        foreach (var filter in context.Configuration.VersionFilters)
         {
-            if (context.Configuration == null)
+            if (filter.Exclude(version, out var reason))
+            {
+                this.log.Info(reason);
                 return false;
-
-            foreach (var filter in context.Configuration.VersionFilters)
-            {
-                if (filter.Exclude(version, out var reason))
-                {
-                    this.log.Info(reason);
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private void FixTheBaseVersionSourceOfMergeMessageStrategyIfReleaseBranchWasMergedAndDeleted(IEnumerable<Versions> baseVersions)
-        {
-            if (ReleaseBranchExistsInRepo()) return;
-            foreach (var baseVersion in baseVersions)
-            {
-                if (baseVersion.Version?.Source.Contains(MergeMessageVersionStrategy.MergeMessageStrategyPrefix) == true
-                    && baseVersion.Version.Source.Contains("Merge branch")
-                    && baseVersion.Version.Source.Contains("release"))
-                {
-                    var parents = baseVersion.Version.BaseVersionSource!.Parents.ToList();
-                    baseVersion.Version = new BaseVersion(
-                        baseVersion.Version.Source,
-                        baseVersion.Version.ShouldIncrement,
-                        baseVersion.Version.SemanticVersion,
-                        this.repositoryStore.FindMergeBase(parents[0], parents[1]),
-                        baseVersion.Version.BranchNameOverride);
-                }
             }
         }
+        return true;
+    }
 
-        private bool ReleaseBranchExistsInRepo()
+    private void FixTheBaseVersionSourceOfMergeMessageStrategyIfReleaseBranchWasMergedAndDeleted(IEnumerable<Versions> baseVersions)
+    {
+        if (ReleaseBranchExistsInRepo()) return;
+        foreach (var baseVersion in baseVersions)
         {
-            var releaseBranchConfig = context.FullConfiguration?.GetReleaseBranchConfig();
-            var releaseBranches = this.repositoryStore.GetReleaseBranches(releaseBranchConfig);
-            return releaseBranches.Any();
+            if (baseVersion.Version?.Source.Contains(MergeMessageVersionStrategy.MergeMessageStrategyPrefix) == true
+                && baseVersion.Version.Source.Contains("Merge branch")
+                && baseVersion.Version.Source.Contains("release"))
+            {
+                var parents = baseVersion.Version.BaseVersionSource!.Parents.ToList();
+                baseVersion.Version = new BaseVersion(
+                    baseVersion.Version.Source,
+                    baseVersion.Version.ShouldIncrement,
+                    baseVersion.Version.SemanticVersion,
+                    this.repositoryStore.FindMergeBase(parents[0], parents[1]),
+                    baseVersion.Version.BranchNameOverride);
+            }
         }
+    }
 
-        private class Versions
-        {
-            public SemanticVersion? IncrementedVersion { get; set; }
-            public BaseVersion? Version { get; set; }
+    private bool ReleaseBranchExistsInRepo()
+    {
+        var releaseBranchConfig = context.FullConfiguration?.GetReleaseBranchConfig();
+        var releaseBranches = this.repositoryStore.GetReleaseBranches(releaseBranchConfig);
+        return releaseBranches.Any();
+    }
 
-            public override string ToString() => $"{Version} | {IncrementedVersion}";
-        }
+    private class Versions
+    {
+        public SemanticVersion? IncrementedVersion { get; set; }
+        public BaseVersion? Version { get; set; }
+
+        public override string ToString() => $"{Version} | {IncrementedVersion}";
     }
 }
